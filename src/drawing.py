@@ -46,7 +46,7 @@ from hand_tracking import (
 )
 from gesture_state import (
     GestureStateMachine, DRAW, MOVE, ERASE, CORRECT, CORRECT_CANDIDATE,
-    SELECT, GRAB, PINCH,
+    SELECT, GRAB, PINCH, FILL_CANDIDATE, FILL,
 )
 from shape_correction import classify_stroke_debug, render_clean_shape
 
@@ -65,12 +65,26 @@ PALETTE_COLORS = [
     (255, 0, 0),      # blue
     (0, 255, 255),    # yellow
     (255, 0, 255),    # magenta
+    (0, 140, 255),    # orange
+    (128, 0, 128),    # purple
+    (255, 255, 0),    # cyan
+    (128, 128, 128),  # gray
+    (30, 105, 210),   # brown
+    (203, 192, 255),  # pink
 ]
-SWATCH_SIZE = 40
-SWATCH_GAP = 10
+SWATCH_SIZE = 32
+SWATCH_GAP = 6
 SWATCH_MARGIN = 15
 PALETTE_HOVER_SECONDS = 1.0
 GESTURE_LABEL_Y = 100
+
+# Undo button — sits just right of the palette row, hover-and-hold to
+# trigger, same interaction pattern as picking a palette color.
+UNDO_BUTTON_WIDTH = 60
+UNDO_BUTTON_GAP = 16   # gap between the last swatch and the undo button
+UNDO_BUTTON_COLOR = (60, 60, 60)          # BGR, dark gray fill
+UNDO_BUTTON_TEXT_COLOR = (255, 255, 255)  # BGR, white label
+UNDO_BUTTON_FONT_SCALE = 0.45
 
 PALM_LANDMARK_IDS = (0, 5, 9, 13, 17)
 INDEX_TIP_ID = 8
@@ -101,6 +115,35 @@ GESTURE_LABEL_FONT_SCALE = 0.8
 STATUS_MESSAGE_FONT_SCALE = 0.6
 SELECT_BOX_COLOR = (255, 140, 0)           # BGR, orange — live drag rectangle while selecting
 SELECTION_HIGHLIGHT_COLOR = (255, 255, 0)  # BGR, cyan — locked selection outline
+
+# Small on-screen gesture legend, drawn just under the current-gesture
+# label so newcomers to a demo can follow along without a README.
+GESTURE_LEGEND = [
+    "Index: Draw",
+    "Index+Middle: Move",
+    "All 5 up: Erase",
+    "Pinky, hold: Correct shape",
+    "Thumb+Index+Middle, drag: Select",
+    "Fist: Move selection",
+    "Pinch: Scale selection",
+    "Index+Middle+Ring, hold: Fill",
+]
+LEGEND_FONT_SCALE = 0.38
+LEGEND_LINE_HEIGHT = 16
+LEGEND_TEXT_COLOR = (255, 255, 255)   # BGR, white — for contrast against the dark backdrop panel
+LEGEND_BACKDROP_COLOR = (0, 0, 0)
+LEGEND_BACKDROP_ALPHA = 0.35
+LEGEND_PADDING = 6
+
+MAX_FILL_AREA_RATIO = 0.6
+# A paint-bucket fill only ever replaces contiguous BACKGROUND pixels, so
+# a genuinely closed shape's interior is always a small fraction of the
+# whole canvas. If a stroke has even a single-pixel gap in its border,
+# the flood fill leaks straight through it and paints most/all of the
+# canvas instead. Rather than let that happen invisibly, the fill is
+# tried on a scratch copy first and only committed if the filled area
+# stays under this fraction of total canvas area — anything bigger is
+# treated as "not actually closed" and aborted with a status message.
 
 
 class Canvas:
@@ -182,10 +225,70 @@ class Canvas:
                 break
         self._rerender()
 
-    # --- selection support (Phase 4.5) ---
+    def fill_at(self, point, color, max_area_ratio=MAX_FILL_AREA_RATIO):
+        """
+        Paint-bucket fill: floods the contiguous BACKGROUND-colored region
+        starting at `point` with `color`. Because flood fill only ever
+        replaces background pixels, any stroke or shape border it touches
+        stops it dead — so filling the ring between two nested closed
+        shapes paints only the ring, and the border strokes themselves
+        (drawn in their own solid color, never background) are never
+        touched or covered.
+
+        Runs on a scratch copy first and measures the filled area before
+        committing, since an unclosed border would otherwise let the
+        flood leak across the whole canvas — see MAX_FILL_AREA_RATIO.
+
+        Returns (success: bool, filled_area_px: int).
+        """
+        x, y = point
+        if not (0 <= x < self.width and 0 <= y < self.height):
+            return False, 0
+
+        # Only background pixels are fillable — if the fingertip is over
+        # a stroke line or an already-filled region, this is just a no-op
+        # rather than an error.
+        if tuple(int(c) for c in self.surface[y, x]) != tuple(self.bg_color):
+            return False, 0
+
+        scratch = self.surface.copy()
+        mask = np.zeros((self.height + 2, self.width + 2), dtype=np.uint8)
+        filled_area, _, _, _ = cv2.floodFill(
+            scratch, mask, (x, y), color, loDiff=(0, 0, 0), upDiff=(0, 0, 0)
+        )
+
+        if filled_area > max_area_ratio * (self.width * self.height):
+            return False, filled_area  # region wasn't actually closed — abort
+
+        self.surface = scratch
+        self.items.append({"type": "fill", "point": point, "color": color})
+        return True, filled_area
+
+    def undo(self):
+        """
+        Remove the most recently added item (stroke, shape, or fill) and
+        re-render. Simple last-action undo, matching a single 'Undo'
+        button rather than a full history stack.
+        """
+        if not self.items:
+            return False
+        self.items.pop()
+        self._current_stroke = None
+        self._was_drawing = False
+        self.prev_point = None
+        self._rerender()
+        return True
+
 
     def _item_bbox(self, item):
-        """Bounding box (x, y, w, h) of any item, stroke or shape."""
+        """Bounding box (x, y, w, h) of any item, stroke, shape, or fill.
+
+        A fill's seed point is always somewhere inside the region it
+        painted, so giving it a 1x1 "bbox" at that point means a SELECT
+        drag around the enclosing shape automatically contains the fill's
+        bbox too (since the point sits inside that same drag box) — the
+        fill rides along with its border on GRAB/PINCH without needing
+        any separate parent-item tracking."""
         if item["type"] == "stroke":
             pts = item["points"]
             if not pts:
@@ -194,6 +297,9 @@ class Canvas:
             return cv2.boundingRect(contour)
         elif item["type"] == "shape":
             return item["shape_result"].bounding_box
+        elif item["type"] == "fill":
+            x, y = item["point"]
+            return (x, y, 1, 1)
         return None
 
     def select_items_in_bbox(self, selection_bbox):
@@ -250,6 +356,9 @@ class Canvas:
                 x, y, w, h = item["shape_result"].bounding_box
                 new_x, new_y = self._clamp_point((x + dx, y + dy))
                 item["shape_result"].bounding_box = (new_x, new_y, w, h)
+            elif item["type"] == "fill":
+                px, py = item["point"]
+                item["point"] = self._clamp_point((px + dx, py + dy))
         self._rerender()
 
     def scale_items(self, indices, factor, anchor):
@@ -277,13 +386,24 @@ class Canvas:
                 nh = max(MIN_SHAPE_SIZE, int(h * factor))
                 cx, cy = self._clamp_point((nx, ny))
                 item["shape_result"].bounding_box = (cx, cy, nw, nh)
+            elif item["type"] == "fill":
+                px, py = item["point"]
+                nx = int(ax + (px - ax) * factor)
+                ny = int(ay + (py - ay) * factor)
+                item["point"] = self._clamp_point((nx, ny))
         self._rerender()
 
     def _rerender(self):
         """Redraw the whole surface from scratch using self.items, in order.
         Used only on correction/select-transform events (occasional), not
         every frame — except during an active PINCH/GRAB, where it does
-        run every frame; fine at whiteboard-canvas resolution/item counts."""
+        run every frame; fine at whiteboard-canvas resolution/item counts.
+
+        Fill items are replayed as a flood fill at their (possibly
+        translated/scaled) seed point. This only works correctly because
+        items are processed in the same order they were created: a fill's
+        enclosing border is always an earlier item in the list, so it's
+        already back on the surface by the time the fill re-floods."""
         self.surface = np.full((self.height, self.width, 3), self.bg_color, dtype=np.uint8)
         for item in self.items:
             if item["type"] == "stroke":
@@ -292,6 +412,14 @@ class Canvas:
                     cv2.line(self.surface, p1, p2, item["color"], STROKE_THICKNESS)
             elif item["type"] == "shape":
                 render_clean_shape(self.surface, item["shape_result"], thickness=STROKE_THICKNESS)
+            elif item["type"] == "fill":
+                x, y = item["point"]
+                if 0 <= x < self.width and 0 <= y < self.height:
+                    mask = np.zeros((self.height + 2, self.width + 2), dtype=np.uint8)
+                    cv2.floodFill(
+                        self.surface, mask, (x, y), item["color"],
+                        loDiff=(0, 0, 0), upDiff=(0, 0, 0)
+                    )
 
 
 class Selection:
@@ -323,6 +451,61 @@ def get_palette_rects(frame_width):
         rects.append((x, y, x + SWATCH_SIZE, y + SWATCH_SIZE))
         x += SWATCH_SIZE + SWATCH_GAP
     return rects
+
+
+def get_undo_button_rect(palette_rects):
+    """Undo button sits just to the right of the last palette swatch,
+    same row, same height."""
+    last_x2 = palette_rects[-1][2]
+    last_y1 = palette_rects[-1][1]
+    x1 = last_x2 + UNDO_BUTTON_GAP
+    y1 = last_y1
+    x2 = x1 + UNDO_BUTTON_WIDTH
+    y2 = y1 + SWATCH_SIZE
+    return (x1, y1, x2, y2)
+
+
+def draw_undo_button(frame, rect, hover_progress=0.0):
+    x1, y1, x2, y2 = rect
+    cv2.rectangle(frame, (x1, y1), (x2, y2), UNDO_BUTTON_COLOR, -1)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 255), 1)
+    text_size = cv2.getTextSize("UNDO", cv2.FONT_HERSHEY_SIMPLEX, UNDO_BUTTON_FONT_SCALE, 1)[0]
+    text_x = x1 + ((x2 - x1) - text_size[0]) // 2
+    text_y = y1 + ((y2 - y1) + text_size[1]) // 2
+    cv2.putText(
+        frame, "UNDO", (text_x, text_y),
+        cv2.FONT_HERSHEY_SIMPLEX, UNDO_BUTTON_FONT_SCALE, UNDO_BUTTON_TEXT_COLOR, 1, cv2.LINE_AA
+    )
+    # Hover-hold progress bar, same visual language as the palette swatches
+    if hover_progress > 0:
+        bar_width = int((x2 - x1) * hover_progress)
+        cv2.rectangle(frame, (x1, y2 + 4), (x1 + bar_width, y2 + 8), (0, 255, 255), -1)
+
+
+def draw_gesture_legend(frame, top_left):
+    """Small, unobtrusive gesture cheat-sheet drawn under the current
+    gesture label, so a demo viewer can follow along without a README."""
+    x, y = top_left
+    line_sizes = [
+        cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, LEGEND_FONT_SCALE, 1)[0]
+        for line in GESTURE_LEGEND
+    ]
+    panel_width = max(w for w, h in line_sizes) + LEGEND_PADDING * 2
+    panel_height = LEGEND_LINE_HEIGHT * len(GESTURE_LEGEND) + LEGEND_PADDING * 2
+
+    overlay = frame.copy()
+    cv2.rectangle(
+        overlay, (x, y), (x + panel_width, y + panel_height),
+        LEGEND_BACKDROP_COLOR, -1
+    )
+    cv2.addWeighted(overlay, LEGEND_BACKDROP_ALPHA, frame, 1 - LEGEND_BACKDROP_ALPHA, 0, frame)
+
+    for i, line in enumerate(GESTURE_LEGEND):
+        text_y = y + LEGEND_PADDING + (i + 1) * LEGEND_LINE_HEIGHT - 4
+        cv2.putText(
+            frame, line, (x + LEGEND_PADDING, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX, LEGEND_FONT_SCALE, LEGEND_TEXT_COLOR, 1, cv2.LINE_AA
+        )
 
 
 def draw_palette(frame, rects, active_index, hover_index=None, hover_progress=0.0):
@@ -374,6 +557,45 @@ def draw_selection_highlight(frame, bbox, color=SELECTION_HIGHLIGHT_COLOR):
         cv2.rectangle(frame, (cx - 4, cy - 4), (cx + 4, cy + 4), color, -1)
 
 
+class HoldButton:
+    """
+    Generic 'hover here and hold for ~1s to trigger' button — same
+    debounce logic as PaletteSelector, but for a single yes/no target
+    (e.g. Undo) rather than a multi-swatch palette. Firing resets the
+    hold timer rather than requiring you to leave and re-enter, matching
+    exactly how the palette swatches already behave.
+    """
+
+    def __init__(self, hover_seconds=PALETTE_HOVER_SECONDS):
+        self.hover_seconds = hover_seconds
+        self._hover_start_time = None
+
+    def update(self, is_hovering):
+        """Returns (progress 0.0-1.0, triggered bool)."""
+        if not is_hovering:
+            self._hover_start_time = None
+            return 0.0, False
+
+        if self._hover_start_time is None:
+            self._hover_start_time = time.time()
+            return 0.0, False
+
+        elapsed = time.time() - self._hover_start_time
+        progress = min(elapsed / self.hover_seconds, 1.0)
+
+        if elapsed >= self.hover_seconds:
+            self._hover_start_time = time.time()
+            return 1.0, True
+
+        return progress, False
+
+
+def point_in_rect(point, rect):
+    px, py = point
+    x1, y1, x2, y2 = rect
+    return x1 <= px <= x2 and y1 <= py <= y2
+
+
 class PaletteSelector:
     def __init__(self, hover_seconds=PALETTE_HOVER_SECONDS):
         self.hover_seconds = hover_seconds
@@ -410,6 +632,7 @@ def main():
     landmarker = create_hand_landmarker()
     state_machine = GestureStateMachine()
     palette_selector = PaletteSelector()
+    undo_button = HoldButton()
 
     cap = cv2.VideoCapture(0)
 
@@ -421,6 +644,7 @@ def main():
     canvas = None
     active_color_index = 0
     palette_rects = None
+    undo_rect = None
     status_message = ""
     status_message_until = 0
 
@@ -444,6 +668,7 @@ def main():
             h, w = frame.shape[:2]
             canvas = Canvas(h, w)
             palette_rects = get_palette_rects(w)
+            undo_rect = get_undo_button_rect(palette_rects)
 
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
@@ -452,12 +677,17 @@ def main():
 
         gesture_label = "NO HAND"
         hover_index, hover_progress = None, 0.0
+        undo_hover_progress = 0.0
         is_selecting = False
+        hand_positions = None  # saved so landmarks can be drawn AFTER the
+                                # canvas is composited on top of the frame,
+                                # so hand tracking is always visible even
+                                # over a painted/filled area
 
         if result.hand_landmarks:
             hand_landmarks = result.hand_landmarks[0]
             positions = get_landmark_positions(hand_landmarks, frame.shape)
-            draw_hand_landmarks(frame, positions)
+            hand_positions = positions
 
             finger_states = get_finger_states(positions)
             pinch_metrics = get_pinch_metrics(positions)
@@ -488,6 +718,20 @@ def main():
                 hover_index, hover_progress, selected = palette_selector.update(hovered)
                 if selected is not None:
                     active_color_index = selected
+
+                is_hovering_undo = point_in_rect(index_tip, undo_rect)
+                undo_hover_progress, undo_triggered = undo_button.update(is_hovering_undo)
+                if undo_triggered:
+                    if canvas.undo():
+                        selection.indices = [i for i in selection.indices if i < len(canvas.items)]
+                        if selection.indices:
+                            selection.bbox = canvas.combined_bbox(selection.indices)
+                        else:
+                            selection.clear()
+                        status_message = "Undid last action"
+                    else:
+                        status_message = "Nothing to undo"
+                    status_message_until = time.time() + 2.0
 
             elif gesture_label == ERASE:
                 canvas.reset_stroke()
@@ -545,6 +789,18 @@ def main():
                             selection.bbox = canvas.combined_bbox(selection.indices)
                     pinch_prev_ratio = current_ratio
 
+            elif gesture_label == FILL_CANDIDATE:
+                canvas.reset_stroke()
+
+            elif gesture_label == FILL:
+                canvas.reset_stroke()
+                filled, fill_area = canvas.fill_at(index_tip, PALETTE_COLORS[active_color_index])
+                if filled:
+                    status_message = "Filled!"
+                else:
+                    status_message = "Can't fill here — area not fully closed, or already filled"
+                status_message_until = time.time() + 2.5
+
             else:
                 canvas.reset_stroke()
 
@@ -581,6 +837,8 @@ def main():
 
         display_frame = overlay_canvas(frame, canvas.surface)
         draw_palette(display_frame, palette_rects, active_color_index, hover_index, hover_progress)
+        if undo_rect is not None:
+            draw_undo_button(display_frame, undo_rect, undo_hover_progress)
 
         # Live selection-box preview while dragging
         if is_selecting and select_start is not None and select_current is not None:
@@ -591,10 +849,16 @@ def main():
         if selection.has_items() and selection.bbox is not None:
             draw_selection_highlight(display_frame, selection.bbox)
 
+        # Hand landmarks are drawn last, on top of the composited canvas,
+        # so hand tracking stays visible even over painted/filled areas.
+        if hand_positions is not None:
+            draw_hand_landmarks(display_frame, hand_positions)
+
         cv2.putText(
             display_frame, gesture_label, (20, GESTURE_LABEL_Y),
             cv2.FONT_HERSHEY_SIMPLEX, GESTURE_LABEL_FONT_SCALE, TEXT_COLOR, 2, cv2.LINE_AA
         )
+        draw_gesture_legend(display_frame, (20, GESTURE_LABEL_Y + 15))
 
         if status_message and time.time() < status_message_until:
             cv2.putText(

@@ -15,6 +15,12 @@ fist can look identical in plain finger up/down terms (both curl the index
 down toward the palm). The `extension_ratio` in pinch_metrics is what
 actually tells them apart: a pinch reaches OUT away from the palm, a fist
 stays curled IN near it.
+
+Phase 6 — Paint-bucket fill gesture added:
+  FILL_CANDIDATE (index+middle+ring up, thumb+pinky down), held for
+  ~1s -> fires FILL once, which flood-fills the closed region under the
+  index fingertip with the active palette color. Uses the same
+  candidate/hold-timer mechanism as CORRECT_CANDIDATE -> CORRECT.
 """
 
 import time
@@ -42,10 +48,13 @@ CORRECT = "CORRECT"
 SELECT = "SELECT"     # thumb+index+middle up, drag a selection box
 GRAB = "GRAB"          # fist, drags active selection
 PINCH = "PINCH"        # thumb+index pinch, scales active selection live
+FILL_CANDIDATE = "FILL_CANDIDATE"  # index+middle+ring up, being held
+FILL = "FILL"          # fires once after FILL_CANDIDATE has been held long enough
 UNKNOWN = "UNKNOWN"    # finger combo doesn't match any known gesture
 
 BUFFER_SIZE = 8          # rolling buffer length (8-10 frames per the doc)
 HOLD_SECONDS = 1.0       # how long CORRECT_CANDIDATE must be stable to fire CORRECT
+                         # (also reused as the hold time for FILL_CANDIDATE -> FILL)
 
 # --- Pinch detection tuning ---
 # Both are starting values — tune against your own hand once you're testing.
@@ -94,6 +103,8 @@ def classify_gesture(finger_states, pinch_metrics=None):
         return CORRECT_CANDIDATE
     if thumb and index and middle and not ring and not pinky:
         return SELECT
+    if not thumb and index and middle and ring and not pinky:
+        return FILL_CANDIDATE
 
     return UNKNOWN
 
@@ -102,15 +113,26 @@ class GestureStateMachine:
     """
     Wraps raw per-frame gesture classification with:
       1. A rolling buffer + majority vote, to kill single-frame flicker.
-      2. A hold-timer for CORRECT_CANDIDATE -> fires CORRECT once held ~1 second.
+      2. A hold-timer for any "candidate" gesture that must be held
+         continuously for `hold_seconds` before it fires its one-shot
+         "triggered" counterpart (CORRECT_CANDIDATE -> CORRECT,
+         FILL_CANDIDATE -> FILL). Generalized over a dict so new
+         hold-to-trigger gestures can be added without duplicating the
+         timer/edge-trigger logic.
     """
+
+    # candidate stable-gesture -> the one-shot gesture it fires once held
+    HOLD_TRIGGERS = {
+        CORRECT_CANDIDATE: CORRECT,
+        FILL_CANDIDATE: FILL,
+    }
 
     def __init__(self, buffer_size=BUFFER_SIZE, hold_seconds=HOLD_SECONDS):
         self.buffer = deque(maxlen=buffer_size)
         self.hold_seconds = hold_seconds
 
-        self._candidate_start_time = None
-        self._correct_already_fired = False
+        self._hold_start_times = {}   # candidate gesture -> time.time() it started being held
+        self._already_fired = {}      # candidate gesture -> True once its trigger has fired
 
     def _stable_gesture(self):
         """Majority vote across the rolling buffer."""
@@ -124,26 +146,31 @@ class GestureStateMachine:
     def update(self, finger_states, pinch_metrics=None):
         """
         Feed one frame's finger states (+ optional pinch metrics) in.
-        Returns the current *stable* gesture name, which will be "CORRECT"
-        for exactly one update() call when the pinky-hold completes
-        (edge-triggered, not repeated every frame).
+        Returns the current *stable* gesture name. For any hold-trigger
+        candidate (CORRECT_CANDIDATE, FILL_CANDIDATE), the corresponding
+        one-shot gesture (CORRECT, FILL) is returned for exactly one
+        update() call once the hold completes (edge-triggered, not
+        repeated every frame it's held).
         """
         raw_gesture = classify_gesture(finger_states, pinch_metrics)
         self.buffer.append(raw_gesture)
         stable = self._stable_gesture()
 
-        if stable == CORRECT_CANDIDATE:
-            if self._candidate_start_time is None:
-                self._candidate_start_time = time.time()
+        if stable in self.HOLD_TRIGGERS:
+            if self._hold_start_times.get(stable) is None:
+                self._hold_start_times[stable] = time.time()
 
-            held_duration = time.time() - self._candidate_start_time
-            if held_duration >= self.hold_seconds and not self._correct_already_fired:
-                self._correct_already_fired = True
-                return CORRECT
-            return CORRECT_CANDIDATE
+            held_duration = time.time() - self._hold_start_times[stable]
+            if held_duration >= self.hold_seconds and not self._already_fired.get(stable):
+                self._already_fired[stable] = True
+                return self.HOLD_TRIGGERS[stable]
+            return stable
         else:
-            self._candidate_start_time = None
-            self._correct_already_fired = False
+            # Any other stable gesture resets ALL hold timers, so switching
+            # candidates (or dropping the pose entirely) doesn't leave a
+            # stale timer running for one you're no longer holding.
+            self._hold_start_times = {}
+            self._already_fired = {}
             return stable
 
 
