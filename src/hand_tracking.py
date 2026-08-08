@@ -40,6 +40,18 @@ FINGER_TIPS = {"index": 8, "middle": 12, "ring": 16, "pinky": 20}
 FINGER_PIPS = {"index": 6, "middle": 10, "ring": 14, "pinky": 18}
 THUMB_TIP = 4
 THUMB_IP = 3
+THUMB_MCP = 2
+PINKY_MCP = 17
+
+THUMB_EXTENSION_MARGIN = 1.05
+# The thumb is "up" (extended) if its tip sits at least this much farther
+# from the pinky-knuckle (palm-width reference) than its own base knuckle
+# (THUMB_MCP) does. A folded thumb tucks its tip in close to the palm,
+# near THUMB_MCP's own distance from PINKY_MCP; an extended thumb reaches
+# well past it. 1.05 gives a small buffer above the break-even point
+# (>1.0) so the reading doesn't flicker right at the boundary — raise it
+# if a folded thumb near the corner of frame still reads as "up", lower
+# it if a genuinely extended thumb is being missed.
 
 
 def create_hand_landmarker():
@@ -96,15 +108,21 @@ def get_finger_states(landmarks):
     """
     states = []
 
-    # Thumb: x-based check, orientation-aware (works for either hand in frame)
-    thumb_tip_x = landmarks[THUMB_TIP][0]
-    thumb_ip_x = landmarks[THUMB_IP][0]
-    wrist_x = landmarks[0][0]
-    middle_mcp_x = landmarks[9][0]
-    if middle_mcp_x >= wrist_x:
-        thumb_up = thumb_tip_x > thumb_ip_x
-    else:
-        thumb_up = thumb_tip_x < thumb_ip_x
+    # Thumb: distance-based check, rotation-invariant. The old approach
+    # compared x-coordinates and guessed "which side is thumb-side" from
+    # wrist-vs-middle-knuckle x position — that guess only holds when the
+    # hand is roughly upright/facing the camera. It breaks down whenever
+    # the arm reaches toward a frame corner and the hand is rotated
+    # diagonally, misreading a folded thumb as extended (or vice versa).
+    # Comparing distances from a stable palm landmark (pinky MCP) instead
+    # works at any in-plane rotation, since it doesn't rely on any
+    # particular image axis lining up with "up."
+    thumb_tip = landmarks[THUMB_TIP]
+    thumb_mcp = landmarks[THUMB_MCP]
+    pinky_mcp = landmarks[PINKY_MCP]
+    tip_dist = math.hypot(thumb_tip[0] - pinky_mcp[0], thumb_tip[1] - pinky_mcp[1])
+    mcp_dist = math.hypot(thumb_mcp[0] - pinky_mcp[0], thumb_mcp[1] - pinky_mcp[1])
+    thumb_up = tip_dist > mcp_dist * THUMB_EXTENSION_MARGIN
     states.append(thumb_up)
 
     # Other four fingers: y-based check

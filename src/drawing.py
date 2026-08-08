@@ -198,9 +198,18 @@ class Canvas:
 
     def select_items_in_bbox(self, selection_bbox):
         """
-        Indices of items whose own bbox overlaps the given selection
-        rectangle. Overlap rather than full-containment, since a loose
-        drag around a shape is more forgiving to use one-handed.
+        Indices of items whose own bbox is FULLY CONTAINED within the
+        given selection rectangle. Containment rather than mere overlap:
+        with nested shapes (e.g. a small circle drawn inside a big
+        triangle), the circle's bbox always sits inside the triangle's
+        bbox, so a plain overlap test would grab the triangle any time
+        you tried to drag-select just the circle. Containment fixes this:
+        dragging a box around only the circle doesn't fully enclose the
+        (bigger) triangle's bbox, so the triangle is correctly left out;
+        dragging a box around the whole triangle DOES fully enclose the
+        circle's bbox too (since it's nested inside), so both come along
+        together as one group, same as Canva/Figma-style rubber-band
+        select.
         """
         sx, sy, sw, sh = selection_bbox
         selected = []
@@ -209,8 +218,8 @@ class Canvas:
             if ib is None:
                 continue
             ix, iy, iw, ih = ib
-            overlap = not (ix + iw < sx or sx + sw < ix or iy + ih < sy or sy + sh < iy)
-            if overlap:
+            contained = (ix >= sx and iy >= sy and ix + iw <= sx + sw and iy + ih <= sy + sh)
+            if contained:
                 selected.append(i)
         return selected
 
