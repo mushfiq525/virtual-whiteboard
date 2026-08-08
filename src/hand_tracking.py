@@ -8,6 +8,7 @@ Download from:
 https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
 """
 
+import math
 import os
 import time
 import cv2
@@ -115,6 +116,46 @@ def get_finger_states(landmarks):
     return states
 
 
+def get_pinch_metrics(landmarks):
+    """
+    Measures the thumb-index "pinch" shape, used to detect the PINCH/scale
+    gesture and to disambiguate it from a closed fist (GRAB). Both metrics
+    are normalized by a hand-scale reference (wrist-to-middle-knuckle
+    distance) so they stay roughly consistent regardless of how close the
+    hand is to the camera.
+
+    Returns a dict:
+      - "distance_ratio": thumb tip <-> index tip distance. Small when
+        pinching (touching or nearly so), larger as they spread apart.
+      - "index_extension_ratio": distance from the index fingertip to its
+        own base knuckle (index MCP, landmark 5). This is what separates a
+        genuine pinch from a fist: in a pinch the index finger stays
+        relatively straight (large ratio) even while its tip touches the
+        thumb; in a fist the index is curled all the way in (small ratio)
+        regardless of where the thumb happens to rest on top of it.
+
+    Returns None if the hand-scale reference collapses to zero (shouldn't
+    happen in practice, but guards a divide-by-zero).
+    """
+    thumb_tip = landmarks[THUMB_TIP]
+    index_tip = landmarks[FINGER_TIPS["index"]]
+    index_mcp = landmarks[5]
+    wrist = landmarks[0]
+    middle_mcp = landmarks[9]
+
+    hand_scale = math.hypot(middle_mcp[0] - wrist[0], middle_mcp[1] - wrist[1])
+    if hand_scale == 0:
+        return None
+
+    distance = math.hypot(index_tip[0] - thumb_tip[0], index_tip[1] - thumb_tip[1])
+    index_extension = math.hypot(index_tip[0] - index_mcp[0], index_tip[1] - index_mcp[1])
+
+    return {
+        "distance_ratio": distance / hand_scale,
+        "index_extension_ratio": index_extension / hand_scale,
+    }
+
+
 def draw_hand_landmarks(frame, pixel_positions):
     """Manually draws landmark dots + connective lines (replaces mp_drawing.draw_landmarks)."""
     for start_idx, end_idx in HAND_CONNECTIONS:
@@ -133,7 +174,7 @@ def main():
 
     landmarker = create_hand_landmarker()
     cap = cv2.VideoCapture(0)  # adjust index if needed (0, 1, 2...)
-    
+
     cv2.namedWindow("Phase 1 - Hand Tracking Test", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Phase 1 - Hand Tracking Test", 960, 540)
 
