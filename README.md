@@ -230,6 +230,7 @@ if that's what's active).
   constants at the top of `hand_tracking.py` and `gesture_state.py` if
   gestures misfire on a different hand/setup.
 
-## License
+## Live Demo
+go to https://virtual-whiteboard-project.streamlit.app/
 
 <!-- Add your license here, e.g. MIT -->
