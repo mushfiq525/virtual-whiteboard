@@ -32,8 +32,7 @@ matplotlib==3.11.1
 mediapipe==1.0.0
 narwhals==2.24.0
 numpy==2.5.1
-opencv-contrib-python==5.0.0.93
-opencv-python==5.0.0.93
+opencv-python-headless==5.0.0.93
 packaging==26.3
 pandas==3.0.5
 pillow==12.3.0
@@ -45,7 +44,6 @@ pyee==13.0.1
 pylibsrtp==1.0.0
 pyOpenSSL==26.4.0
 pyparsing==3.3.2
-pytesseract==0.3.13
 python-dateutil==2.9.0.post0
 python-multipart==0.0.32
 referencing==0.37.0
