@@ -29,9 +29,30 @@ Phase 4.5 — Selection transform:
                                         it, anchored on the selection's own
                                         center so it doesn't drift while
                                         resizing.
+
+Phase 6 — Polish and UX:
+  - Live fingertip smoothing (step 37): a small moving-average window over
+    the last few raw index-fingertip positions, applied only while DRAW is
+    active. This is a *different* concern from shape_correction.py's
+    `_smooth_points()` — that one cleans up a stroke's points after the
+    fact, right before shape classification; this one smooths the point
+    actually used to draw the line and to record the stroke, frame by
+    frame, so the raw line itself has less hand-tremor wobble in it to
+    begin with. Reset every time DRAW stops, so a new stroke starts from
+    a clean buffer instead of dragging in points from wherever the hand
+    was during the previous, unrelated stroke.
+  - FPS-adaptive tracking (step 38): measures actual loop FPS over a
+    rolling window and, if it drops too low, starts running MediaPipe
+    detection on every *other* frame instead of every frame, reusing the
+    previous frame's landmark result in between. The camera feed and
+    canvas still render every frame either way — only the (comparatively
+    expensive) landmark detection call is skipped. Hysteresis (a lower
+    "start skipping" threshold and a higher "stop skipping" threshold)
+    keeps this from flapping on/off right at the boundary.
 """
 
 import time
+from collections import deque
 
 import cv2
 import numpy as np
@@ -72,19 +93,22 @@ PALETTE_COLORS = [
     (30, 105, 210),   # brown
     (203, 192, 255),  # pink
 ]
-SWATCH_SIZE = 32
-SWATCH_GAP = 6
+SWATCH_SIZE = 26
+SWATCH_GAP = 5
 SWATCH_MARGIN = 15
 PALETTE_HOVER_SECONDS = 1.0
-GESTURE_LABEL_Y = 100
+GESTURE_LABEL_Y = 70
 
 # Undo button — sits just right of the palette row, hover-and-hold to
-# trigger, same interaction pattern as picking a palette color.
-UNDO_BUTTON_WIDTH = 60
-UNDO_BUTTON_GAP = 16   # gap between the last swatch and the undo button
+# trigger (same interaction pattern as picking a palette color, and
+# repeats step-by-step for as long as you keep hovering — see HoldButton
+# below). A 'z' keypress does the same single-step undo, for quick
+# testing without needing the gesture.
+UNDO_BUTTON_WIDTH = 48
+UNDO_BUTTON_GAP = 12   # gap between the last swatch and the undo button
 UNDO_BUTTON_COLOR = (60, 60, 60)          # BGR, dark gray fill
 UNDO_BUTTON_TEXT_COLOR = (255, 255, 255)  # BGR, white label
-UNDO_BUTTON_FONT_SCALE = 0.45
+UNDO_BUTTON_FONT_SCALE = 0.38
 
 PALM_LANDMARK_IDS = (0, 5, 9, 13, 17)
 INDEX_TIP_ID = 8
@@ -109,6 +133,22 @@ GRAB_DEADZONE_PX = 3
 # reference point still updates, so real motion above the deadzone isn't
 # delayed or lost, it just doesn't compound noise.
 
+FINGERTIP_SMOOTHING_WINDOW = 5
+# Moving-average window (in frames) for the live index-fingertip position
+# while DRAW is active (Phase 6, step 37). Small on purpose: big enough to
+# visibly soften hand-tremor jitter in the line as it's being drawn, small
+# enough that it doesn't noticeably lag behind fast fingertip motion.
+
+# --- FPS-adaptive tracking (Phase 6, step 38) ---
+FPS_CHECK_WINDOW = 30       # frames averaged together to estimate current FPS
+FPS_SKIP_THRESHOLD = 18     # avg FPS below this -> start skipping tracking every other frame
+FPS_RESUME_THRESHOLD = 24   # avg FPS above this -> go back to tracking every frame
+# Two different thresholds (rather than one) give this hysteresis: sitting
+# right at a single cutoff would flip skip-mode on and off every time FPS
+# ticks a fraction above/below it. A gap between "start skipping" and
+# "stop skipping" means the average has to clearly recover before tracking
+# resumes every frame, not just barely graze the line.
+
 # UI text styling
 TEXT_COLOR = (0, 59, 6)  # BGR for #063B00 (dark green)
 GESTURE_LABEL_FONT_SCALE = 0.8
@@ -127,13 +167,15 @@ GESTURE_LEGEND = [
     "Fist: Move selection",
     "Pinch: Scale selection",
     "Index+Middle+Ring, hold: Fill",
+    "Undo button, hold: Undo (repeats while held)",
+    "'z' key: Undo one step",
 ]
-LEGEND_FONT_SCALE = 0.38
-LEGEND_LINE_HEIGHT = 16
+LEGEND_FONT_SCALE = 0.32
+LEGEND_LINE_HEIGHT = 14
 LEGEND_TEXT_COLOR = (255, 255, 255)   # BGR, white — for contrast against the dark backdrop panel
 LEGEND_BACKDROP_COLOR = (0, 0, 0)
 LEGEND_BACKDROP_ALPHA = 0.35
-LEGEND_PADDING = 6
+LEGEND_PADDING = 5
 
 MAX_FILL_AREA_RATIO = 0.6
 # A paint-bucket fill only ever replaces contiguous BACKGROUND pixels, so
@@ -590,6 +632,53 @@ class HoldButton:
         return progress, False
 
 
+class FingertipSmoother:
+    """
+    Moving average over the last `window` raw fingertip points, used to
+    de-jitter the *live* point DRAW uses each frame (Phase 6, step 37).
+
+    Deliberately simple/stateful rather than reusing shape_correction.py's
+    `_smooth_points()`: that function smooths an already-*completed* list
+    of points all at once (it can look at neighbors on both sides of each
+    point). Mid-stroke, future points don't exist yet — only a running
+    average of what's been seen so far is available — so this needs its
+    own small rolling buffer instead.
+    """
+
+    def __init__(self, window=FINGERTIP_SMOOTHING_WINDOW):
+        self.window = window
+        self._buffer = deque(maxlen=window)
+
+    def reset(self):
+        """Call whenever DRAW stops, so the next stroke's first points
+        aren't averaged in with wherever the fingertip was during a
+        previous, unrelated stroke."""
+        self._buffer.clear()
+
+    def smooth(self, point):
+        self._buffer.append(point)
+        avg_x = sum(p[0] for p in self._buffer) / len(self._buffer)
+        avg_y = sum(p[1] for p in self._buffer) / len(self._buffer)
+        return (int(avg_x), int(avg_y))
+
+
+def perform_undo(canvas, selection):
+    """
+    Undo exactly one step (stroke, shape, or fill) and keep the locked
+    selection in sync — shared by both the hover-and-hold Undo button and
+    the 'z' keyboard shortcut, so they can't drift out of sync with each
+    other. Returns the status message to display.
+    """
+    if canvas.undo():
+        selection.indices = [i for i in selection.indices if i < len(canvas.items)]
+        if selection.indices:
+            selection.bbox = canvas.combined_bbox(selection.indices)
+        else:
+            selection.clear()
+        return "Undid last action"
+    return "Nothing to undo"
+
+
 def point_in_rect(point, rect):
     px, py = point
     x1, y1, x2, y2 = rect
@@ -628,7 +717,8 @@ def main():
     thumb+index+middle drag-select (locks on release), fist-drag to move
     the locked selection, and a thumb-index pinch to scale it live. A
     quick SELECT tap (no meaningful drag) while something is already
-    locked deselects it."""
+    locked deselects it. Phase 6 adds live fingertip smoothing on DRAW
+    and FPS-adaptive tracking (see module docstring)."""
     landmarker = create_hand_landmarker()
     state_machine = GestureStateMachine()
     palette_selector = PaletteSelector()
@@ -636,8 +726,8 @@ def main():
 
     cap = cv2.VideoCapture(0)
 
-    cv2.namedWindow("Phase 4.5 - Selection Transform Test", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Phase 4.5 - Selection Transform Test", 960, 540)
+    cv2.namedWindow("Phase 6 - Polish Test", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Phase 6 - Polish Test", 960, 540)
 
     start_time = time.time()
 
@@ -659,7 +749,19 @@ def main():
     grab_prev_point = None
     pinch_prev_ratio = None
 
+    # Live fingertip smoothing while DRAW is active (Phase 6, step 37)
+    draw_smoother = FingertipSmoother()
+
+    # FPS-adaptive tracking (Phase 6, step 38)
+    frame_times = deque(maxlen=FPS_CHECK_WINDOW)
+    skip_tracking = False
+    current_fps = 0.0
+    frame_index = 0
+    last_landmark_result = None  # reused on frames where tracking is skipped
+
     while True:
+        loop_start = time.time()
+
         ret, frame = cap.read()
         if not ret:
             break
@@ -670,10 +772,24 @@ def main():
             palette_rects = get_palette_rects(w)
             undo_rect = get_undo_button_rect(palette_rects)
 
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-        timestamp_ms = int((time.time() - start_time) * 1000)
-        result = landmarker.detect_for_video(mp_image, timestamp_ms)
+        frame_index += 1
+        # Once FPS has been measured as consistently low, run MediaPipe
+        # detection on every other frame and reuse the previous frame's
+        # result in between — the (comparatively expensive) part being
+        # skipped is landmark *detection*, not rendering, so the camera
+        # feed and canvas still update every frame regardless.
+        run_tracking = True
+        if skip_tracking and frame_index % 2 == 0 and last_landmark_result is not None:
+            run_tracking = False
+
+        if run_tracking:
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+            timestamp_ms = int((time.time() - start_time) * 1000)
+            result = landmarker.detect_for_video(mp_image, timestamp_ms)
+            last_landmark_result = result
+        else:
+            result = last_landmark_result
 
         gesture_label = "NO HAND"
         hover_index, hover_progress = None, 0.0
@@ -703,14 +819,24 @@ def main():
                 pinch_prev_ratio = None
 
             is_drawing = gesture_label == DRAW
+            # Smooth only the point actually used for drawing/stroke
+            # storage (Phase 6, step 37) — hover targets (palette, undo,
+            # SELECT box, FILL seed point) keep using the raw fingertip so
+            # they stay maximally responsive; only the drawn line itself
+            # benefits from de-jittering.
+            if is_drawing:
+                draw_point = draw_smoother.smooth(index_tip)
+            else:
+                draw_smoother.reset()
+                draw_point = index_tip
             canvas.update_stroke_tracking(
-                is_drawing, index_tip, PALETTE_COLORS[active_color_index]
+                is_drawing, draw_point, PALETTE_COLORS[active_color_index]
             )
 
             if gesture_label == DRAW:
                 if canvas.prev_point is not None:
-                    canvas.draw_line(canvas.prev_point, index_tip, PALETTE_COLORS[active_color_index])
-                canvas.prev_point = index_tip
+                    canvas.draw_line(canvas.prev_point, draw_point, PALETTE_COLORS[active_color_index])
+                canvas.prev_point = draw_point
 
             elif gesture_label == MOVE:
                 canvas.reset_stroke()
@@ -722,15 +848,7 @@ def main():
                 is_hovering_undo = point_in_rect(index_tip, undo_rect)
                 undo_hover_progress, undo_triggered = undo_button.update(is_hovering_undo)
                 if undo_triggered:
-                    if canvas.undo():
-                        selection.indices = [i for i in selection.indices if i < len(canvas.items)]
-                        if selection.indices:
-                            selection.bbox = canvas.combined_bbox(selection.indices)
-                        else:
-                            selection.clear()
-                        status_message = "Undid last action"
-                    else:
-                        status_message = "Nothing to undo"
+                    status_message = perform_undo(canvas, selection)
                     status_message_until = time.time() + 2.0
 
             elif gesture_label == ERASE:
@@ -807,6 +925,7 @@ def main():
         else:
             canvas.reset_stroke()
             canvas.update_stroke_tracking(False, None, None)
+            draw_smoother.reset()
             grab_prev_point = None
             pinch_prev_ratio = None
 
@@ -866,13 +985,44 @@ def main():
                 cv2.FONT_HERSHEY_SIMPLEX, STATUS_MESSAGE_FONT_SCALE, TEXT_COLOR, 2, cv2.LINE_AA
             )
 
-        cv2.imshow("Phase 4.5 - Selection Transform Test", display_frame)
+        # Small FPS readout, top-right — mainly so `FPS_SKIP_THRESHOLD` /
+        # `FPS_RESUME_THRESHOLD` can be tuned against what your own
+        # machine+webcam actually deliver (Phase 6, step 38).
+        fps_text = f"FPS: {current_fps:.0f}" + (" (tracking every 2nd frame)" if skip_tracking else "")
+        fps_text_size = cv2.getTextSize(fps_text, cv2.FONT_HERSHEY_SIMPLEX, STATUS_MESSAGE_FONT_SCALE, 1)[0]
+        cv2.putText(
+            display_frame, fps_text, (frame.shape[1] - fps_text_size[0] - 20, 30),
+            cv2.FONT_HERSHEY_SIMPLEX, STATUS_MESSAGE_FONT_SCALE, TEXT_COLOR, 1, cv2.LINE_AA
+        )
+
+        cv2.imshow("Phase 6 - Polish Test", display_frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
         elif key == ord('c'):
             canvas.clear()
             selection.clear()
+        elif key == ord('z'):
+            # Keyboard undo — same single-step logic as the hover-and-hold
+            # Undo button, just triggered by a keypress instead of a
+            # gesture. Holding the key down relies on your OS's normal
+            # key-repeat to keep firing this every loop iteration, giving
+            # the same "hold to keep undoing" feel as Ctrl+Z elsewhere.
+            status_message = perform_undo(canvas, selection)
+            status_message_until = time.time() + 2.0
+
+        # FPS measurement + skip-tracking hysteresis (Phase 6, step 38).
+        # Measured over the whole loop iteration (tracking + drawing/
+        # transform logic + render + waitKey), since that's what actually
+        # determines how responsive the app feels — not just the
+        # detection call in isolation.
+        frame_times.append(time.time() - loop_start)
+        if len(frame_times) == frame_times.maxlen:
+            current_fps = len(frame_times) / sum(frame_times)
+            if current_fps < FPS_SKIP_THRESHOLD:
+                skip_tracking = True
+            elif current_fps > FPS_RESUME_THRESHOLD:
+                skip_tracking = False
 
     cap.release()
     cv2.destroyAllWindows()
