@@ -62,7 +62,7 @@ from drawing import (
     perform_undo,
     get_palette_rects, get_undo_button_rect, draw_undo_button, draw_palette,
     get_hovered_swatch, get_palm_center, overlay_canvas, selection_bbox,
-    draw_selection_highlight, draw_gesture_legend, point_in_rect,
+    draw_selection_highlight, point_in_rect,
     PALETTE_COLORS, INDEX_TIP_ID, GESTURE_LABEL_Y, TEXT_COLOR,
     GESTURE_LABEL_FONT_SCALE, STATUS_MESSAGE_FONT_SCALE, SELECT_BOX_COLOR,
     MIN_SELECT_SIZE, GRAB_DEADZONE_PX, PINCH_FRAME_FACTOR_MIN,
@@ -129,6 +129,15 @@ class WhiteboardProcessor(VideoProcessorBase):
         self._pending_clear = False
         self._pending_undo = False
 
+        # Whether to horizontally flip the incoming frame before any
+        # processing. Some browsers/OSes mirror a phone's front-facing
+        # camera at the capture level (so the raw track itself is already
+        # flipped), others don't — Iriun on desktop never does. Rather
+        # than guess per-device, this is a plain user-facing toggle (see
+        # the sidebar checkbox below) driven from the main Streamlit
+        # thread the same way Clear/Undo are.
+        self.mirror = False
+
     # --- called from Streamlit's main thread, by the buttons below ---
     def request_clear(self):
         with self._lock:
@@ -154,6 +163,13 @@ class WhiteboardProcessor(VideoProcessorBase):
 
     def _process_frame(self, img):
         loop_start = time.time()
+
+        if self.mirror:
+            # Flip once, up front, before anything downstream (hand
+            # tracking, drawing, canvas) ever sees the frame — so the
+            # mirrored view stays internally consistent instead of only
+            # being mirrored cosmetically after the fact.
+            img = cv2.flip(img, 1)
 
         h, w = img.shape[:2]
         if self.canvas is None or (self.canvas.height, self.canvas.width) != (h, w):
@@ -380,7 +396,6 @@ class WhiteboardProcessor(VideoProcessorBase):
             display_frame, gesture_label, (20, GESTURE_LABEL_Y),
             cv2.FONT_HERSHEY_SIMPLEX, GESTURE_LABEL_FONT_SCALE, TEXT_COLOR, 2, cv2.LINE_AA
         )
-        draw_gesture_legend(display_frame, (20, GESTURE_LABEL_Y + 15))
 
         if self.status_message and time.time() < self.status_message_until:
             cv2.putText(
@@ -410,15 +425,54 @@ class WhiteboardProcessor(VideoProcessorBase):
 # Streamlit page
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="Gesture Whiteboard", layout="wide")
-st.title("✋ Gesture-Controlled Smart Whiteboard")
+st.title("Gesture-Controlled Smart Whiteboard")
 st.caption(
     "Draw, auto-correct shapes, select, move, scale, and fill — all with "
     "hand gestures. Click **START** below and allow camera access."
 )
 
-RTC_CONFIGURATION = RTCConfiguration(
-    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-)
+def _build_rtc_configuration():
+    """STUN alone only gets a direct peer-to-peer connection when both
+    sides are behind simple NAT — that's true on a home WiFi/PC setup,
+    but mobile data (carrier-grade NAT) and many other WiFi networks
+    block it outright, and Streamlit Community Cloud's own network can
+    block direct WebRTC media too. A TURN server relays the media
+    instead of negotiating a direct link, so it works in those cases.
+
+    TURN credentials are pulled from st.secrets so nothing is hardcoded
+    here. Add a [turn] section to .streamlit/secrets.toml (locally) or
+    the app's "Secrets" settings (on Streamlit Community Cloud):
+
+        TURN_URL = "turn:your-turn-host:3478"
+        TURN_USERNAME = "..."
+        TURN_CREDENTIAL = "..."
+
+    e.g. from a free provider like Open Relay Project / metered.ca, or
+    Twilio's Network Traversal Service. If secrets aren't configured,
+    this quietly falls back to STUN-only so local development still
+    works — but mobile-data/other-network connections will keep
+    timing out until TURN is added.
+    """
+    ice_servers = [{"urls": ["stun:stun.l.google.com:19302"]}]
+
+    try:
+        turn_url = st.secrets.get("TURN_URL")
+        turn_username = st.secrets.get("TURN_USERNAME")
+        turn_credential = st.secrets.get("TURN_CREDENTIAL")
+    except Exception:
+        turn_url = turn_username = turn_credential = None
+
+    if turn_url and turn_username and turn_credential:
+        ice_servers.append({
+            "urls": [turn_url],
+            "username": turn_username,
+            "credential": turn_credential,
+        })
+
+    return RTCConfiguration({"iceServers": ice_servers})
+
+
+RTC_CONFIGURATION = _build_rtc_configuration()
 
 webrtc_ctx = webrtc_streamer(
     key="gesture-whiteboard",
@@ -446,6 +500,18 @@ webrtc_ctx = webrtc_streamer(
     },
     async_processing=True,
 )
+
+mirror = st.checkbox(
+    "🪞 Mirror camera",
+    value=False,
+    help=(
+        "Some devices/browsers already mirror the front camera before it "
+        "reaches this app, others don't — flip this on if drawing feels "
+        "left/right reversed."
+    ),
+)
+if webrtc_ctx.video_processor:
+    webrtc_ctx.video_processor.mirror = mirror
 
 st.write("")
 col1, col2 = st.columns(2)
